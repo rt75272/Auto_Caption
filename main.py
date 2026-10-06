@@ -2,7 +2,6 @@ import base64
 import json
 import os
 import re
-from difflib import SequenceMatcher
 from datetime import datetime
 from io import BytesIO
 from urllib.error import URLError
@@ -43,7 +42,16 @@ OLLAMA_MODEL = os.environ.get("AUTOCAPTION_VISION_MODEL", "qwen3.5:latest")
 
 
 def extract_tag_details(tag_image_path):
-    """Read a likely title line and displayed price from a close-up tag."""
+    """
+    Extract the product title and current price shown on a close-up tag.
+
+    Args:
+        tag_image_path: Path to the close-up shelf-tag image.
+
+    Returns:
+        A tuple of (title, price). Either value is None when OCR cannot
+        confidently identify it.
+    """
     try:
         img = Image.open(tag_image_path)
         data = pytesseract.image_to_data(
@@ -126,12 +134,29 @@ def extract_tag_details(tag_image_path):
 
 
 def extract_product_name(tag_image_path):
-    """Extract the title text from the close-up out-of-stock image."""
+    """
+    Extract the title text from a close-up out-of-stock tag image.
+
+    Args:
+        tag_image_path: Path to the close-up shelf-tag image.
+
+    Returns:
+        The recognized product title, or None when no title is found.
+    """
     title, _ = extract_tag_details(tag_image_path)
     return title
 
 
 def capture_timestamp(path):
+    """
+    Parse the camera timestamp embedded in an image filename.
+
+    Args:
+        path: Image path containing a YYYYMMDD_HHMMSSmmm timestamp.
+
+    Returns:
+        A datetime for the timestamp, or None if the filename has no match.
+    """
     match = re.search(r"(\d{8})_(\d{9})", os.path.basename(path))
     if match is None:
         return None
@@ -142,7 +167,17 @@ def capture_timestamp(path):
 
 
 def read_bay_text(image_path, cache):
-    """Read visible text and word locations from a bay image once per image."""
+    """
+    OCR visible text and cache each word's confidence and image coordinates.
+
+    Args:
+        image_path: Path to a bay image.
+        cache: Mutable mapping used to reuse OCR results by image path.
+
+    Returns:
+        A list of normalized text, confidence, bounding-box coordinates,
+        and original text tuples for the image.
+    """
     if image_path not in cache:
         image = Image.open(image_path).convert("RGB")
         data = pytesseract.image_to_data(
@@ -166,82 +201,24 @@ def read_bay_text(image_path, cache):
     return cache[image_path]
 
 
-def find_title_box(title, price, bay_words, image_size):
-    """Estimate a product-slot rectangle from OCR text or its shelf price."""
-    title_tokens = [
-        re.sub(r"[^A-Z0-9]", "", token.upper())
-        for token in title.split()
-    ]
-    title_tokens = [
-        token for token in title_tokens
-        if len(token) >= 4 and token not in TITLE_METADATA_WORDS
-    ]
-    matches = []
-    for token in title_tokens:
-        for word in bay_words:
-            recognized, confidence, left, top, width, height, _ = word
-            if confidence < 25 or len(recognized) < 4:
-                continue
-            similarity = SequenceMatcher(None, token, recognized).ratio()
-            if similarity >= 0.78:
-                matches.append(
-                    (
-                        left + width / 2,
-                        top + height / 2,
-                        token,
-                        confidence * similarity,
-                        left,
-                        top,
-                        left + width,
-                        top + height,
-                    )
-                )
+def find_empty_slot_box(price, bay_words, image_size):
+    """
+    Estimate a vacant shelf slot from its unique matching price label.
 
-    if matches:
-        image_width, image_height = image_size
-        radius_x = image_width * 0.12
-        radius_y = image_height * 0.08
-        best_group = max(
-            matches,
-            key=lambda match: sum(
-                1
-                for other in matches
-                if abs(other[0] - match[0]) <= radius_x
-                and abs(other[1] - match[1]) <= radius_y
-            ),
-        )
-        nearby = [
-            match
-            for match in matches
-            if abs(match[0] - best_group[0]) <= radius_x
-            and abs(match[1] - best_group[1]) <= radius_y
-        ]
-        unique_tokens = {match[2] for match in nearby}
-        strongest = max(nearby, key=lambda match: match[3])
-        if len(unique_tokens) >= 2 or (
-            len(strongest[2]) >= 8 and strongest[3] >= 70
-        ):
-            text_left = min(match[4] for match in nearby)
-            text_top = min(match[5] for match in nearby)
-            text_right = max(match[6] for match in nearby)
-            text_bottom = max(match[7] for match in nearby)
-            center_x = (text_left + text_right) / 2
-            center_y = (text_top + text_bottom) / 2
-            box_width = min(
-                image_width * 0.25,
-                max((text_right - text_left) * 3, image_width * 0.08),
-            )
-            box_height = min(
-                image_height * 0.25,
-                max((text_bottom - text_top) * 5, image_height * 0.12),
-            )
-            return (
-                max(0, center_x - box_width / 2),
-                max(0, center_y - box_height / 2),
-                min(image_width, center_x + box_width / 2),
-                min(image_height, center_y + box_height / 2),
-            )
+    Title OCR is deliberately not used here: matching printed text on a
+    product could incorrectly mark an in-stock package as out of stock.
 
+    Args:
+        price: Current price read from the close-up tag, without a currency
+            symbol.
+        bay_words: OCR word records returned by read_bay_text.
+        image_size: Bay image dimensions as (width, height), in pixels.
+
+    Returns:
+        A pixel rectangle (left, top, right, bottom) immediately above the
+        unique matching shelf-price label, or None if the price is missing or
+        ambiguous.
+    """
     if price:
         normalized_price = re.sub(r"\D", "", price)
         price_hits = [
@@ -251,7 +228,10 @@ def find_title_box(title, price, bay_words, image_size):
             and word[1] >= 35
         ]
         if len(price_hits) == 1:
-            _, _, left, top, width, _, _ = price_hits[0]
+            _, confidence, left, top, width, _, _ = price_hits[0]
+            if confidence < 35:
+                return None
+
             center_x = left + width / 2
             box_width = image_size[0] * 0.12
             box_height = image_size[1] * 0.14
@@ -267,7 +247,16 @@ def find_title_box(title, price, bay_words, image_size):
 
 
 def check_vision_model():
-    """Check whether the configured local Ollama vision model is available."""
+    """
+    Check whether the configured local Ollama vision model is available.
+
+    Args:
+        None.
+
+    Returns:
+        True when Ollama responds and lists the configured model; otherwise
+        False, with a warning for a missing model.
+    """
     try:
         with urlopen(f"{OLLAMA_URL}/api/tags", timeout=3) as response:
             models = json.load(response).get("models", [])
@@ -286,11 +275,27 @@ def check_vision_model():
 
 
 def query_vision_model(prompt, image_paths, max_image_size=1024):
-    """Send resized local images to Ollama and parse its JSON response."""
+    """
+    Send local images to Ollama and decode its JSON response.
+
+    Args:
+        prompt: Instruction sent to the configured vision model.
+        image_paths: Paths or Pillow images encoded and sent with the prompt.
+        max_image_size: Maximum width or height for each encoded image.
+
+    Returns:
+        The parsed JSON value, or None if the model response is not valid JSON.
+
+    Raises:
+        RuntimeError: If the local Ollama request fails.
+    """
     images = []
     for path in image_paths:
-        with Image.open(path) as source:
-            image = source.convert("RGB")
+        if isinstance(path, Image.Image):
+            image = path.convert("RGB")
+        else:
+            with Image.open(path) as source:
+                image = source.convert("RGB")
         image.thumbnail((max_image_size, max_image_size))
         buffer = BytesIO()
         image.save(buffer, format="JPEG", quality=88)
@@ -338,8 +343,87 @@ def query_vision_model(prompt, image_paths, max_image_size=1024):
         return None
 
 
+def verify_empty_slot_with_vision(product_box, bay_path, image_size):
+    """
+    Confirm that a proposed rectangle contains no stocked product.
+
+    The model receives the full bay with the candidate outlined, plus its
+    normalized coordinates. Missing, malformed, or uncertain answers fail
+    closed.
+
+    Args:
+        product_box: Candidate pixel rectangle (left, top, right, bottom).
+        bay_path: Path to the original bay image.
+        image_size: Original bay dimensions as (width, height), in pixels.
+
+    Returns:
+        True only when the model explicitly confirms the outlined area is
+        visibly empty with confidence of at least 0.7.
+    """
+    left, top, right, bottom = (
+        int(round(value)) for value in product_box
+    )
+    left = max(0, min(left, image_size[0]))
+    right = max(0, min(right, image_size[0]))
+    top = max(0, min(top, image_size[1]))
+    bottom = max(0, min(bottom, image_size[1]))
+    if left >= right or top >= bottom:
+        return False
+
+    normalized_box = [
+        round(left / image_size[0] * 1000),
+        round(top / image_size[1] * 1000),
+        round(right / image_size[0] * 1000),
+        round(bottom / image_size[1] * 1000),
+    ]
+    with Image.open(bay_path) as source:
+        marked_bay = source.convert("RGB")
+    marker = ImageDraw.Draw(marked_bay)
+    marker_width = max(10, int(min(image_size) * 0.004))
+    marker.rectangle(
+        (left, top, right, bottom),
+        outline=(0, 0, 0),
+        width=marker_width + 6,
+    )
+    marker.rectangle(
+        (left, top, right, bottom),
+        outline=(255, 0, 0),
+        width=marker_width,
+    )
+
+    result = query_vision_model(
+        f"Inspect the full grocery bay image. A thick red rectangle marks "
+        f"the candidate area; its coordinates are [left,top,right,bottom] "
+        f"on a 0..1000 normalized x/y scale: {normalized_box}. Is the entire "
+        "area INSIDE the red outline visibly vacant shelf/backing, with no "
+        "product bag, package, bottle, or stocked merchandise? If any "
+        "merchandise is inside the outline, or the region is unclear, answer false. "
+        "Return JSON only: "
+        '{"empty_slot":true,"confidence":0.95} or '
+        '{"empty_slot":false,"confidence":0.95}.',
+        [marked_bay],
+        max_image_size=1536,
+    )
+    if not isinstance(result, dict) or result.get("empty_slot") is not True:
+        return False
+    try:
+        confidence = float(result.get("confidence", 0))
+    except (TypeError, ValueError):
+        return False
+    return confidence >= 0.7
+
+
 def read_tag_with_vision(tag_path):
-    """Read the exact product title and current price from a close-up tag."""
+    """
+    Read a product title and displayed current price with the vision model.
+
+    Args:
+        tag_path: Path to a close-up electronic shelf-tag image.
+
+    Returns:
+        A (title, price) tuple, with price possibly None, or None if the model
+        cannot return a usable title.
+    """
     result = query_vision_model(
         "Read this close-up electronic shelf tag. Transcribe the complete "
         "product name exactly as printed, including words on wrapped title "
@@ -366,27 +450,91 @@ def read_tag_with_vision(tag_path):
     return title, price
 
 
-def locate_with_vision(title, price, bay_path, image_size):
-    """Locate a product or its likely shelf slot within a full bay image."""
+def locate_with_vision(
+    title,
+    price,
+    bay_path,
+    image_size,
+    bay_words=None,
+):
+    """
+    Find only a visibly empty shelf slot associated with an out-of-stock tag.
+
+    Args:
+        title: Product name read from its close-up shelf tag.
+        price: Current price read from the tag, or None if unavailable.
+        bay_path: Path to the wide image that will be annotated.
+        image_size: Bay image dimensions as (width, height), in pixels.
+        bay_words: Optional OCR word records for verifying alignment to a
+            unique matching shelf-price label.
+
+    Returns:
+        A (title, product_box) tuple for a visually empty slot, or None when
+        the model cannot establish an empty slot or its price alignment is
+        inconsistent.
+    """
     price_hint = f"${price}" if price else "not legible"
+    # Keep the bay as the only image in this request so all coordinates have
+    # one unambiguous reference frame. The close-up is already read as text.
     result = query_vision_model(
-        f'Find the exact package named "{title}", current price '
-        f"{price_hint}, in this grocery bay photo. Use the brand and full "
-        "product name to distinguish it from similar products. If the "
-        "product is present, box the package. If it is out of stock, find "
-        "its matching shelf price and box the empty product-facing slot "
-        "immediately above that price, using neighboring packages to "
-        "estimate the missing product's area. Do not box the price label. "
-        "Return JSON only: "
-        '{"bbox_2d":[left,top,right,bottom]}, coordinates are 0..1000 '
-        "fractions of the full image, x then y from the top-left. If the "
-        "exact package cannot be identified, return null.",
+        f"In this grocery bay image, find the out-of-stock product "
+        f"{title!r} at "
+        f"{price_hint}. Locate its matching shelf price in the bay and "
+        "inspect the shelf-facing space directly above that price. Return "
+        "a box ONLY if that area is visibly vacant shelf space where the "
+        "missing package would sit. The box must enclose the empty gap, not "
+        "any neighboring or in-stock package, a product label, or a price "
+        "tag. Use adjacent package widths and shelf boundaries to estimate "
+        "the missing item's footprint, and keep the box tightly within the "
+        "visible gap. If the product appears to be in stock, the matching "
+        "price cannot be found, or the gap is obscured/uncertain, return "
+        '{"status":"no_empty_slot","bbox_2d":null}. Otherwise return JSON '
+        "only in this exact form: "
+        '{"status":"empty_slot_found","evidence":"visible vacant shelf '
+        'space directly above matching price","bbox_2d":[left,top,right,'
+        "bottom]}. Coordinates are 0..1000 fractions of the full bay image, "
+        "x then y from the top-left.",
         [bay_path],
         max_image_size=1536,
     )
     if isinstance(result, dict):
-        if "bbox_2d" in result or "bbox" in result:
+        if (
+            ("bbox_2d" in result or "bbox" in result)
+            and "status" not in result
+            and isinstance(result.get("empty_slot_found"), str)
+        ):
+            detections = [
+                {
+                    **result,
+                    "status": "empty_slot_found",
+                    "evidence": result["empty_slot_found"],
+                }
+            ]
+        elif "bbox_2d" in result or "bbox" in result:
             detections = [result]
+        elif "empty_slot_found" in result:
+            found = result["empty_slot_found"]
+            if isinstance(found, dict):
+                detections = [found]
+            elif isinstance(found, list):
+                detections = [
+                    detection
+                    for detection in found
+                    if isinstance(detection, dict)
+                ]
+            elif isinstance(found, str):
+                detections = [
+                    {
+                        "status": "empty_slot_found",
+                        "evidence": found,
+                        "bbox_2d": result.get("bbox_2d"),
+                        "confidence": result.get("confidence", 0.65),
+                    }
+                ]
+            else:
+                detections = []
+            for detection in detections:
+                detection.setdefault("status", "empty_slot_found")
         else:
             detections = [
                 {"label": label, "bbox_2d": box[0]}
@@ -411,6 +559,15 @@ def locate_with_vision(title, price, bay_path, image_size):
 
     for detection in detections:
         if not isinstance(detection, dict):
+            continue
+        if str(detection.get("status", "")).strip().lower() != "empty_slot_found":
+            continue
+        evidence = detection.get("evidence", "")
+        if not isinstance(evidence, str) or not re.search(
+            r"\b(empty|vacant|unoccupied|bare|gap)\b",
+            evidence,
+            flags=re.IGNORECASE,
+        ):
             continue
         label = detection.get("label") or detection.get("title") or ""
         box = detection.get("bbox_2d") or detection.get("bbox")
@@ -443,8 +600,8 @@ def locate_with_vision(title, price, bay_path, image_size):
         if not (
             0 <= left < right <= 1
             and 0 <= top < bottom <= 1
-            and right - left <= 0.6
-            and bottom - top <= 0.6
+            and right - left <= 0.45
+            and bottom - top <= 0.45
         ):
             continue
 
@@ -454,20 +611,60 @@ def locate_with_vision(title, price, bay_path, image_size):
             continue
         if confidence < 0.45:
             continue
-        return (
-            title,
-            (
-                left * image_size[0],
-                top * image_size[1],
-                right * image_size[0],
-                bottom * image_size[1],
-            ),
+
+        # When OCR can uniquely read the shelf price, reject boxes that are
+        # not directly above and horizontally aligned with that tag.
+        if price and bay_words is not None:
+            normalized_price = re.sub(r"\D", "", price)
+            price_hits = [
+                word
+                for word in bay_words
+                if re.sub(r"\D", "", word[6]) == normalized_price
+                and word[1] >= 35
+            ]
+            if len(price_hits) == 1:
+                _, _, price_left, price_top, price_width, _, _ = price_hits[0]
+                box_left = left * image_size[0]
+                box_right = right * image_size[0]
+                box_bottom = bottom * image_size[1]
+                box_center_x = (box_left + box_right) / 2
+                price_center_x = price_left + price_width / 2
+                if (
+                    abs(box_center_x - price_center_x)
+                    > max(price_width * 2, image_size[0] * 0.06)
+                    or box_bottom > price_top + image_size[1] * 0.025
+                    or price_top - box_bottom > image_size[1] * 0.22
+                ):
+                    continue
+
+        product_box = (
+            left * image_size[0],
+            top * image_size[1],
+            right * image_size[0],
+            bottom * image_size[1],
         )
+        if not verify_empty_slot_with_vision(
+            product_box,
+            bay_path,
+            image_size,
+        ):
+            continue
+        return title, product_box
 
     return None
 
 
 def has_wide_scene_coverage(keypoints, image_shape):
+    """
+    Decide whether keypoints cover enough grid cells to indicate a bay scene.
+
+    Args:
+        keypoints: ORB keypoints detected in the image.
+        image_shape: Grayscale image shape as (height, width).
+
+    Returns:
+        True when occupied grid cells meet MIN_BAY_GRID_COVERAGE.
+    """
     occupied_cells = {
         (
             min(
@@ -485,7 +682,20 @@ def has_wide_scene_coverage(keypoints, image_shape):
 
 
 def analyze_and_map_images(folder_path):
-    """Read each close-up title and map it to a bay image independently."""
+    """
+    Pair each close-up out-of-stock tag with a bay and estimate its empty slot.
+
+    Args:
+        folder_path: Directory containing bay images and MACRO_FOCUS tags.
+
+    Returns:
+        A list of annotation dictionaries containing bay_path, tag_path,
+        title, and product_box. Returns an empty dictionary when no usable
+        image classes are found, or None when there are too few image files.
+
+    Raises:
+        RuntimeError: If the required Tesseract OCR installation is missing.
+    """
     try:
         pytesseract.get_tesseract_version()
     except pytesseract.TesseractNotFoundError as error:
@@ -606,6 +816,7 @@ def analyze_and_map_images(folder_path):
                 title, price = extract_tag_details(path_a)
                 title = title or "TITLE UNREADABLE"
                 bay_image = Image.open(path_b)
+                bay_words = read_bay_text(path_b, bay_text_cache)
                 product_box = None
                 if vision_enabled:
                     try:
@@ -618,6 +829,7 @@ def analyze_and_map_images(folder_path):
                                 price,
                                 path_b,
                                 bay_image.size,
+                                bay_words=bay_words,
                             )
                             if vision_match:
                                 title, product_box = vision_match
@@ -636,17 +848,34 @@ def analyze_and_map_images(folder_path):
                     )
 
                 if product_box is None:
-                    product_box = find_title_box(
-                        title,
+                    # A unique shelf price is only a candidate location. Even
+                    # this fallback must pass the same visual vacancy check.
+                    candidate_box = find_empty_slot_box(
                         price,
-                        read_bay_text(path_b, bay_text_cache),
+                        bay_words,
                         bay_image.size,
                     )
+                    if candidate_box is not None and vision_enabled:
+                        try:
+                            if verify_empty_slot_with_vision(
+                                candidate_box,
+                                path_b,
+                                bay_image.size,
+                            ):
+                                product_box = candidate_box
+                        except RuntimeError as error:
+                            tqdm.write(
+                                f"{Fore.RED}[ERROR]{Style.RESET_ALL} "
+                                f"{error}. Disabling local vision checks for "
+                                "the remaining images."
+                            )
+                            vision_enabled = False
                 if product_box is None:
                     tqdm.write(
                         f"{Fore.YELLOW}[WARNING]{Style.RESET_ALL} No "
-                        f"reliable product location found for {title!r} in "
-                        f"{os.path.basename(path_b)}."
+                        f"visibly empty shelf slot confirmed for {title!r} "
+                        f"in {os.path.basename(path_b)}; leaving it "
+                        "unannotated rather than marking stocked goods."
                     )
 
                 annotations.append(
@@ -677,13 +906,35 @@ def analyze_and_map_images(folder_path):
 
     return annotations
 
+
 def caption_bays(annotations, folder_path):
-    """Render all tagged product areas together on one image per bay."""
+    """
+    Render grouped tag labels and empty-slot boxes onto one output per bay.
+
+    Args:
+        annotations: Annotation dictionaries from analyze_and_map_images.
+        folder_path: Directory where annotated_bays output is written.
+
+    Returns:
+        None. Outputs are saved as annotated copies of the source bay images.
+    """
     output_dir = os.path.join(folder_path, "annotated_bays")
     os.makedirs(output_dir, exist_ok=True)
 
+    unlocated_count = sum(
+        annotation["product_box"] is None for annotation in annotations
+    )
+    if unlocated_count:
+        tqdm.write(
+            f"{Fore.YELLOW}[WARNING]{Style.RESET_ALL} Skipping "
+            f"{unlocated_count} tag label(s) without a verified empty-slot "
+            "location; no label will be drawn in an arbitrary image corner."
+        )
+
     grouped_annotations = {}
     for annotation in annotations:
+        if annotation["product_box"] is None:
+            continue
         grouped_annotations.setdefault(annotation["bay_path"], []).append(
             annotation
         )
@@ -705,6 +956,15 @@ def caption_bays(annotations, folder_path):
             )
 
             def load_font(size):
+                """
+                Load a bold font with a portable default fallback.
+
+                Args:
+                    size: Requested font size in pixels.
+
+                Returns:
+                    A Pillow font instance.
+                """
                 for font_path in font_path_options:
                     try:
                         return ImageFont.truetype(font_path, size)
@@ -713,6 +973,16 @@ def caption_bays(annotations, folder_path):
                 return ImageFont.load_default(size=size)
 
             def overlap_area(first, second):
+                """
+                Calculate the intersection area of two pixel rectangles.
+
+                Args:
+                    first: Rectangle in (left, top, right, bottom) order.
+                    second: Rectangle in the same format.
+
+                Returns:
+                    The overlap area in square pixels.
+                """
                 width = max(0, min(first[2], second[2]) - max(first[0], second[0]))
                 height = max(0, min(first[3], second[3]) - max(first[1], second[1]))
                 return width * height
@@ -783,6 +1053,8 @@ def caption_bays(annotations, folder_path):
                 )
 
             for product_box in product_boxes:
+                # Outline the inferred empty footprint; never outline nearby
+                # stock as a substitute for a missing product.
                 draw.rectangle(
                     product_box,
                     outline=(0, 0, 0),
@@ -823,6 +1095,8 @@ def caption_bays(annotations, folder_path):
 
                 best_position = None
                 best_score = None
+                # Candidate positions stay close to their own slot. Scoring
+                # avoids other slot boxes and labels already placed on this bay.
                 for candidate_x, candidate_y in candidates:
                     candidate_x = max(
                         0, min(candidate_x, bay_img.width - width)
